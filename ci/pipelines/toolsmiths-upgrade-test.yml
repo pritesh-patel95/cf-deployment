@@ -1,0 +1,411 @@
+---
+resource_types:
+- name: toolsmiths-cf-pool
+  type: docker-image
+  source:
+    repository: cftoolsmiths/toolsmiths-envs-resource
+
+resources:
+- name: cf-deployment-concourse-tasks
+  type: git
+  icon: github-box
+  source:
+    branch: master
+    uri: https://github.com/cloudfoundry/cf-deployment-concourse-tasks.git
+
+- name: cf-deployment-develop
+  type: git
+  icon: github-box
+  source:
+    branch: develop
+    uri: git@github.com:cloudfoundry/cf-deployment.git
+    private_key: ((cf_deployment_readwrite_deploy_key.private_key))
+    ignore_paths:
+    - .envrc
+    - .overcommit.yml
+    - ISSUE_TEMPLATE.md
+    - PULL_REQUEST_TEMPLATE.md
+    - ci/**
+    - texts/**
+
+- name: cf-deployment-master
+  type: git
+  icon: github-box
+  source:
+    branch: master
+    uri: git@github.com:cloudfoundry/cf-deployment.git
+    private_key: ((cf_deployment_readwrite_deploy_key.private_key))
+    ignore_paths:
+    - .envrc
+    - .overcommit.yml
+    - ISSUE_TEMPLATE.md
+    - PULL_REQUEST_TEMPLATE.md
+    - ci/**
+    - texts/**
+
+- name: cf-acceptance-tests-rc
+  type: git
+  icon: github-box
+  source:
+    branch: release-candidate
+    uri: git@github.com:cloudfoundry/cf-acceptance-tests.git
+    private_key: ((cf_acceptance_tests_readwrite_deploy_key.private_key))
+
+- name: toolsmiths-upgrade-env
+  type: toolsmiths-cf-pool
+  source:
+    api_token: ((toolsmiths_api_token))
+    hostname: environments.toolsmiths.cf-app.com
+    pool_name: cf-deployment
+  tags:
+  - vsphere-cf-release-integration
+
+- name: toolsmiths-windows-env
+  type: toolsmiths-cf-pool
+  source:
+    api_token: ((toolsmiths_api_token))
+    hostname: environments.toolsmiths.cf-app.com
+    pool_name: cf-deployment
+  tags:
+  - vsphere-cf-release-integration
+
+- name: relint-envs
+  type: git
+  icon: github-box
+  source:
+    branch: master
+    uri: git@github.com:cloudfoundry/relint-envs.git
+    private_key: ((hagrid_env_readwrite_deploy_key.private_key))
+
+jobs:
+- name: upgrade-claim-env
+  serial: true
+  #public: true
+  plan:
+  - put: toolsmiths-upgrade-env
+    params:
+      action: claim
+    tags:
+    - vsphere-cf-release-integration
+    timeout: 4h
+  - get: cf-deployment-develop
+
+- name: upgrade-unclaim-env-manual
+  #public: true
+  plan:
+  - get: toolsmiths-upgrade-env
+    passed:
+    - upgrade-claim-env
+    tags:
+    - vsphere-cf-release-integration
+  - put: toolsmiths-upgrade-env
+    params:
+      action: unclaim
+      env_file: toolsmiths-upgrade-env/metadata
+    tags:
+    - vsphere-cf-release-integration
+
+- name: upgrade-deploy
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-upgrade-env
+    passed:
+    - upgrade-claim-env
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-concourse-tasks
+    - get: cf-deployment-develop
+      passed:
+      - upgrade-claim-env
+    - get: cf-deployment-master
+  - task: bosh-deploy-cf-scale-up
+    file: cf-deployment-concourse-tasks/bosh-deploy/task.yml
+    input_mapping:
+      toolsmiths-env: toolsmiths-upgrade-env
+      cf-deployment: cf-deployment-master
+      ops-files: cf-deployment-master
+    params:
+      OPS_FILES: |
+        operations/use-compiled-releases.yml
+        operations/scale-database-cluster.yml
+        operations/use-internal-lookup-for-route-services.yml
+        operations/experimental/colocate-smoke-tests-on-cc-worker.yml
+  - task: bosh-deploy-cf-develop
+    file: cf-deployment-concourse-tasks/bosh-deploy/task.yml
+    input_mapping:
+      toolsmiths-env: toolsmiths-upgrade-env
+      cf-deployment: cf-deployment-develop
+      ops-files: cf-deployment-develop
+    params:
+      OPS_FILES: |
+        operations/use-compiled-releases.yml
+        operations/scale-database-cluster.yml
+        operations/use-internal-lookup-for-route-services.yml
+        operations/experimental/colocate-smoke-tests-on-cc-worker.yml
+  - in_parallel:
+    - task: open-asgs-for-credhub
+      file: cf-deployment-concourse-tasks/open-asgs-for-bosh-instance-group/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-upgrade-env
+      params:
+        INSTANCE_GROUP_NAME: credhub
+        SECURITY_GROUP_NAME: credhub
+    - task: open-asgs-for-uaa
+      file: cf-deployment-concourse-tasks/open-asgs-for-bosh-instance-group/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-upgrade-env
+      params:
+        INSTANCE_GROUP_NAME: uaa
+        SECURITY_GROUP_NAME: uaa
+    - task: enable-docker-and-tasks
+      file: cf-deployment-concourse-tasks/set-feature-flags/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-upgrade-env
+      params:
+        ENABLED_FEATURE_FLAGS: |
+          diego_docker
+          task_creation
+          service_instance_sharing
+
+- name: upgrade-smoke-tests
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-upgrade-env
+    passed:
+    - upgrade-deploy
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-develop
+      passed:
+      - upgrade-deploy
+    - get: cf-deployment-concourse-tasks
+  - task: bosh-run-errand-smoke-tests
+    file: cf-deployment-concourse-tasks/run-errand/task.yml
+    params:
+      DEPLOYMENT_NAME: cf
+      ERRAND_NAME: smoke_tests
+      INSTANCE: cc-worker/first
+    input_mapping:
+      toolsmiths-env: toolsmiths-upgrade-env
+
+- name: upgrade-cats
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-upgrade-env
+    passed:
+    - upgrade-deploy
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-concourse-tasks
+    - get: cf-acceptance-tests-rc
+    - get: cf-deployment-develop
+      passed:
+      - upgrade-deploy
+    - get: relint-envs
+  - task: update-integration-config
+    file: cf-deployment-concourse-tasks/update-integration-configs/task.yml
+    params:
+      CATS_INTEGRATION_CONFIG_FILE: environments/test/snitch/integration_config.json
+    input_mapping:
+      toolsmiths-env: toolsmiths-upgrade-env
+      integration-configs: relint-envs
+  - task: run-cats
+    file: cf-deployment-concourse-tasks/run-cats/task.yml
+    input_mapping:
+      integration-config: updated-integration-configs
+      cf-acceptance-tests: cf-acceptance-tests-rc
+    params:
+      CONFIG_FILE_PATH: environments/test/snitch/integration_config.json
+
+- name: upgrade-unclaim-env
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-upgrade-env
+    passed:
+    - upgrade-smoke-tests
+    - upgrade-cats
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - put: toolsmiths-upgrade-env
+    params:
+      action: unclaim
+      env_file: toolsmiths-upgrade-env/metadata
+    tags:
+    - vsphere-cf-release-integration
+
+- name: windows-claim-env
+  serial: true
+  #public: true
+  plan:
+  - put: toolsmiths-windows-env
+    params:
+      action: claim
+    tags:
+    - vsphere-cf-release-integration
+    timeout: 4h
+  - get: cf-deployment-develop
+
+- name: windows-unclaim-env-manual
+  #public: true
+  plan:
+  - get: toolsmiths-windows-env
+    passed:
+    - windows-claim-env
+    tags:
+    - vsphere-cf-release-integration
+  - put: toolsmiths-windows-env
+    params:
+      action: unclaim
+      env_file: toolsmiths-windows-env/metadata
+    tags:
+    - vsphere-cf-release-integration
+
+- name: windows-deploy
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-windows-env
+    passed:
+    - windows-claim-env
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-concourse-tasks
+    - get: cf-deployment-develop
+      passed:
+      - windows-claim-env
+  - task: bosh-delete-cf-deployment
+    file: cf-deployment-concourse-tasks/bosh-delete-deployment/task.yml
+    input_mapping:
+      toolsmiths-env: toolsmiths-windows-env
+    params:
+      IGNORE_ERRORS: true
+  - task: bosh-cleanup
+    file: cf-deployment-concourse-tasks/bosh-cleanup/task.yml
+    input_mapping:
+      toolsmiths-env: toolsmiths-windows-env
+  - task: bosh-deploy-cf-develop
+    file: cf-deployment-concourse-tasks/bosh-deploy/task.yml
+    input_mapping:
+      toolsmiths-env: toolsmiths-windows-env
+      cf-deployment: cf-deployment-develop
+      ops-files: cf-deployment-develop
+    params:
+      OPS_FILES: |
+        operations/use-compiled-releases.yml
+        operations/windows2019-cell.yml
+        operations/use-online-windows2019fs.yml
+        operations/experimental/use-compiled-releases-windows.yml
+        operations/use-internal-lookup-for-route-services.yml
+        operations/experimental/colocate-smoke-tests-on-cc-worker.yml
+  - in_parallel:
+    - task: open-asgs-for-credhub
+      file: cf-deployment-concourse-tasks/open-asgs-for-bosh-instance-group/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-windows-env
+      params:
+        INSTANCE_GROUP_NAME: credhub
+        SECURITY_GROUP_NAME: credhub
+    - task: open-asgs-for-uaa
+      file: cf-deployment-concourse-tasks/open-asgs-for-bosh-instance-group/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-windows-env
+      params:
+        INSTANCE_GROUP_NAME: uaa
+        SECURITY_GROUP_NAME: uaa
+    - task: enable-docker-and-tasks
+      file: cf-deployment-concourse-tasks/set-feature-flags/task.yml
+      input_mapping:
+        toolsmiths-env: toolsmiths-windows-env
+      params:
+        ENABLED_FEATURE_FLAGS: |
+          diego_docker
+          task_creation
+          service_instance_sharing
+
+- name: windows-smoke-tests
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-windows-env
+    passed:
+    - windows-deploy
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-develop
+      passed:
+      - windows-deploy
+    - get: cf-deployment-concourse-tasks
+  - task: bosh-run-errand-smoke-tests
+    file: cf-deployment-concourse-tasks/run-errand/task.yml
+    params:
+      DEPLOYMENT_NAME: cf
+      ERRAND_NAME: smoke_tests
+      INSTANCE: cc-worker/first
+    input_mapping:
+      toolsmiths-env: toolsmiths-windows-env
+
+- name: windows-cats
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-windows-env
+    passed:
+    - windows-deploy
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - in_parallel:
+    - get: cf-deployment-concourse-tasks
+    - get: cf-acceptance-tests-rc
+    - get: cf-deployment-develop
+      passed:
+      - windows-deploy
+    - get: relint-envs
+  - task: update-integration-config
+    file: cf-deployment-concourse-tasks/update-integration-configs/task.yml
+    params:
+      CATS_INTEGRATION_CONFIG_FILE: environments/test/trelawney/cats_windows_integration_config.json
+    input_mapping:
+      toolsmiths-env: toolsmiths-windows-env
+      integration-configs: relint-envs
+  - task: run-cats
+    file: cf-deployment-concourse-tasks/run-cats/task.yml
+    input_mapping:
+      integration-config: updated-integration-configs
+      cf-acceptance-tests: cf-acceptance-tests-rc
+    params:
+      CAPTURE_LOGS: true
+      CONFIG_FILE_PATH: environments/test/trelawney/cats_windows_integration_config.json
+
+- name: windows-unclaim-env
+  serial: true
+  #public: true
+  plan:
+  - get: toolsmiths-windows-env
+    passed:
+    - windows-smoke-tests
+    - windows-cats
+    tags:
+    - vsphere-cf-release-integration
+    trigger: true
+  - put: toolsmiths-windows-env
+    params:
+      action: unclaim
+      env_file: toolsmiths-windows-env/metadata
+    tags:
+    - vsphere-cf-release-integration
